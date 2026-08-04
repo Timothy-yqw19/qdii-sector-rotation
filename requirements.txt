@@ -1,0 +1,28 @@
+# 核心（必需）
+# 注意：Tiingo 与 Stooq 都只用 requests 直连，不需要额外的客户端库。
+pandas>=2.0
+numpy>=1.24
+requests>=2.28
+streamlit>=1.30
+
+# 可选：最后一级的价格数据源。Tiingo/Stooq 能用时完全不需要它。
+yfinance>=0.2.40
+
+# FRED 官方 API 只用 requests 直连，**不需要** fredapi 包。
+# 只需设置环境变量：export FRED_API_KEY=你的key
+#   申请（免费，填邮箱即得）: https://fred.stlouisfed.org/docs/api/api_key.html
+#   为什么建议配：有的网络只挡 fred.stlouisfed.org（网页端点），
+#   而 api.stlouisfed.org（官方API）是通的。跑 ./run.sh netcheck 可确认。
+#
+# 可选：ALFRED 真实数据窗（历史发布版本）目前仍走 fredapi
+# fredapi>=0.5
+
+# 可选：实时增强层的情绪模型（不装会自动降级到词典法）
+# transformers>=4.35
+# torch>=2.0
+
+# 可选：Reddit 情绪（需 REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET 环境变量）
+# praw>=7.7
+
+# 可选：测试
+# pytest>=7.0

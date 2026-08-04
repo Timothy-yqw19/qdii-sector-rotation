@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+data/*.csv
+data/*.json
+data/README_*.txt
+output/*.csv
+.streamlit/
+
+# 密钥：绝不提交
+.env

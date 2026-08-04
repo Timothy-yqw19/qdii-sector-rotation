@@ -1,0 +1,331 @@
+"""
+全局配置：板块池、信号定义、方向先验、数据滞后、回测参数。
+
+设计原则（面试可讲）：
+1. 每个信号的方向(direction)不是拍脑袋，而是写明经济学理由(rationale)，
+   并在回测中做符号稳健性检验。
+2. 慢频宏观数据必须按“真实可获得日”滞后，不能用发布日当天的值。
+3. 不预设 20%/15%/10% 这种假精度权重，维度内均值、维度间等权，
+   再用权重敏感性分析证明结论不依赖某一组权重。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+# --------------------------------------------------------------------------
+# 一、板块池（纯美股，做相对强弱而非绝对择时）
+# --------------------------------------------------------------------------
+
+BENCHMARK = "SPY"
+
+SECTORS: dict[str, dict] = {
+    "TECH": {
+        "label": "硬科技 / AI",
+        "primary": "QQQ",           # 打分与交易标的
+        "proxies": ["SMH", "XLK"],  # 辅助信号（半导体贝塔更纯）
+    },
+    "CONSUMER": {
+        "label": "可选消费",
+        "primary": "XLY",
+        "proxies": ["XRT"],
+    },
+}
+
+# 轮动信号 = SCORE[LONG_LEG] - SCORE[SHORT_LEG]
+LONG_LEG, SHORT_LEG = "TECH", "CONSUMER"
+
+ALL_TICKERS = sorted(
+    {BENCHMARK}
+    | {s["primary"] for s in SECTORS.values()}
+    | {p for s in SECTORS.values() for p in s["proxies"]}
+)
+
+# --------------------------------------------------------------------------
+# 二、FRED 宏观序列（含真实发布滞后，单位=日历日）
+# --------------------------------------------------------------------------
+# 滞后来源：FRED 各序列的实际发布节奏。DFII10/BAMLH0A0HYM2 为 T+1 发布；
+# WALCL 为周四发布上周三数据，最坏情况约 8 天可见 → 保守取 9 天。
+
+
+@dataclass(frozen=True)
+class MacroSeries:
+    fred_id: str
+    name: str
+    publication_lag_days: int
+    transform: str  # 'diff_60d' | 'diff_20d' | 'pct_chg_60d' | 'level'
+    # 该序列合理的最短历史（年）。低于此值就怀疑取数路径有问题、去试别的路径。
+    # 对于本身就受限的序列（见下方 BAMLH0A0HYM2），设成 0 表示"短是正常的"。
+    expected_min_years: float = 12.0
+
+
+MACRO_SERIES: list[MacroSeries] = [
+    MacroSeries("DFII10", "10年期TIPS实际利率", 1, "diff_60d"),
+    MacroSeries("DTWEXBGS", "美元指数(广义)", 4, "pct_chg_60d"),
+    # 信用利差：用穆迪 Baa - 10年美债，而不是 ICE BofA 高收益 OAS。
+    # 【踩过的坑，值得写下来】原本用 BAMLH0A0HYM2（高收益OAS），
+    # 抓下来只有 787 行、2023-08 起。一开始以为是端点静默截断，
+    # 查 FRED 页面才发现是**授权限制**：
+    #   "Starting in April 2026, this series will only include 3 years of observations."
+    # ICE Data 的授权变更让 FRED 只保留滚动3年窗口，换端点、重抓都没用。
+    # BAA10Y 测的是同一件事（信用风险溢价 = 风险偏好），
+    # 由穆迪编制、无授权限制，FRED 上有 1986 年至今的日频数据。
+    MacroSeries("BAA10Y", "穆迪Baa-10年美债信用利差", 1, "diff_20d"),
+    MacroSeries("WALCL", "美联储总资产", 9, "pct_chg_60d"),
+    # VIX：另一个独立的风险偏好度量，1990年至今。
+    # 与信用利差相关但不重合——前者是期权市场的隐含预期，后者是信用市场的实际定价。
+    MacroSeries("VIXCLS", "VIX波动率指数", 1, "diff_20d"),
+]
+
+# --------------------------------------------------------------------------
+# 三、信号定义：维度 → 信号 → 各板块方向先验
+# --------------------------------------------------------------------------
+# direction 语义：+1 表示“该信号的 z-score 越高，越利好这个板块”。
+# 幅度差异（如 -1.0 vs -0.5）体现的是敏感度差异，不是权重——
+# 它决定了同一个宏观冲击在两个板块间的“相对”影响。
+
+
+@dataclass(frozen=True)
+class Signal:
+    key: str
+    name: str
+    dimension: str
+    directions: dict[str, float]
+    rationale: str
+
+
+DIMENSIONS = [
+    "momentum_positioning",   # 快：日频，价格与持仓
+    "macro_liquidity",        # 混频：宏观流动性与风险偏好
+    "valuation",              # 慢：相对估值 / 均值回归
+]
+
+# 【最终模型只启用宏观维度 —— 这是被数据筛出来的结果，不是一开始的设计】
+# 三个维度都做了完整诊断（./run.sh report 可复现），结论：
+#   · momentum_positioning : IC_20d = -0.049，单独夏普 -0.45，年换手 25.0 → 否决
+#     配对相对动量与跨行业横截面动量是两回事，前者在本样本上呈反转。
+#   · valuation            : IC_20d = -0.028，单独夏普 -0.19，年换手 11.8 → 否决
+#   · macro_liquidity      : IC_20d = +0.187，三个子样本 IC 全为正 → 保留
+# 保留另外两个维度的代码，是为了让否决过程可复现：
+#   ./run.sh report                          三维全开，看它们如何互相稀释
+#   ./run.sh macro                           最终模型
+#   --dims=momentum_positioning              单独复现被否决的维度
+ACTIVE_DIMENSIONS = ["macro_liquidity"]
+
+DIMENSION_LABELS = {
+    "momentum_positioning": "动量与持仓",
+    "macro_liquidity": "宏观流动性与风险偏好",
+    "valuation": "相对估值(均值回归)",
+}
+
+SIGNALS: list[Signal] = [
+    # ---- 维度1：动量与持仓（快信号，日频真实更新） ----
+    Signal(
+        key="rel_mom_20",
+        name="相对SPY 20日动量",
+        dimension="momentum_positioning",
+        directions={"TECH": 1.0, "CONSUMER": 1.0},
+        rationale="板块相对基准的短期动量，横截面动量在1-3个月尺度上正相关于未来收益。",
+    ),
+    Signal(
+        key="rel_mom_60",
+        name="相对SPY 60日动量",
+        dimension="momentum_positioning",
+        directions={"TECH": 1.0, "CONSUMER": 1.0},
+        rationale="中期趋势，过滤20日动量的噪音。",
+    ),
+    Signal(
+        key="risk_adj_mom_60",
+        name="波动调整后60日动量",
+        dimension="momentum_positioning",
+        directions={"TECH": 1.0, "CONSUMER": 1.0},
+        rationale="用已实现波动率归一，避免高波动板块单纯因为波动大而得高分。",
+    ),
+    Signal(
+        key="money_flow_20",
+        name="20日资金流向代理",
+        dimension="momentum_positioning",
+        directions={"TECH": 1.0, "CONSUMER": 1.0},
+        rationale=(
+            "sign(日收益)×成交额 的20日净额 / 20日总成交额。ETF真实申赎份额历史"
+            "在免费源上不可得，用量价合成的资金流代理，方向与净流入一致。"
+        ),
+    ),
+    # ---- 维度2：宏观流动性与风险偏好（混频，按发布滞后对齐） ----
+    Signal(
+        key="DFII10_diff_60d",
+        name="10年实际利率60日变化",
+        dimension="macro_liquidity",
+        directions={"TECH": -1.0, "CONSUMER": -0.5},
+        rationale=(
+            "实际利率上行压制长久期资产估值。科技板块现金流久期显著长于可选消费，"
+            "故敏感度更高；消费同时受信贷成本影响，方向同为负但幅度较小。"
+        ),
+    ),
+    Signal(
+        key="DTWEXBGS_pct_chg_60d",
+        name="美元指数60日涨幅",
+        dimension="macro_liquidity",
+        directions={"TECH": -1.0, "CONSUMER": -0.3},
+        rationale=(
+            "强美元压制海外收入折算。纳指/半导体海外收入占比约50-60%，"
+            "XLY成分以内需为主(海外占比约15%)，故科技受损更大。"
+        ),
+    ),
+    Signal(
+        key="BAA10Y_diff_20d",
+        name="信用利差(Baa-10Y)20日变化",
+        dimension="macro_liquidity",
+        directions={"TECH": -1.0, "CONSUMER": -0.7},
+        rationale=(
+            "信用利差走阔=risk-off，高贝塔板块受创更深。科技(尤其半导体)贝塔"
+            "历史上高于可选消费，故设更高敏感度。"
+            "用穆迪Baa-10Y而非ICE高收益OAS，因为后者自2026年4月起被FRED"
+            "限制为滚动3年窗口（授权原因），无法支撑长样本回测。"
+        ),
+    ),
+    Signal(
+        key="VIXCLS_diff_20d",
+        name="VIX 20日变化",
+        dimension="macro_liquidity",
+        directions={"TECH": -1.0, "CONSUMER": -0.7},
+        rationale=(
+            "隐含波动率上行=风险偏好收缩，高贝塔成长股回撤更大。"
+            "与信用利差同向但信息源不同：VIX是期权市场的隐含预期，"
+            "信用利差是信用市场的实际定价，两者背离时往往是转折点。"
+        ),
+    ),
+    Signal(
+        key="WALCL_pct_chg_60d",
+        name="美联储总资产60日变化",
+        dimension="macro_liquidity",
+        directions={"TECH": 1.0, "CONSUMER": 0.4},
+        rationale=(
+            "央行扩表=流动性宽松，利好久期长、对流动性最敏感的成长资产。"
+        ),
+    ),
+    # ---- 维度3：相对估值 / 均值回归（慢信号） ----
+    Signal(
+        key="rel_price_pctile_756",
+        name="相对价格比3年分位数",
+        dimension="valuation",
+        directions={"TECH": -1.0, "CONSUMER": -1.0},
+        rationale=(
+            "板块/SPY 价格比的滚动3年分位数。分位数高=相对基准已大幅拉伸，"
+            "构成均值回归逆风。注意：这是'相对价格拉伸度'而非真实PE——"
+            "免费源拿不到长历史forward PE，若提供 data/pe_history.csv 会自动改用真实PE分位数。"
+        ),
+    ),
+    Signal(
+        key="dist_ma200_pctile",
+        name="偏离200日均线分位数",
+        dimension="valuation",
+        directions={"TECH": -1.0, "CONSUMER": -1.0},
+        rationale="价格相对200日均线的偏离度分位数，捕捉短期超买导致的回归压力。",
+    ),
+]
+
+SIGNALS_BY_KEY = {s.key: s for s in SIGNALS}
+
+
+def signals_in(dimension: str) -> list[Signal]:
+    return [s for s in SIGNALS if s.dimension == dimension]
+
+
+# --------------------------------------------------------------------------
+# 四、标准化与打分参数
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class ScoringConfig:
+    # 滚动z-score窗口（交易日）。只用截止当日的信息，防前视。
+    zscore_window: int = 504          # ~2年
+    zscore_min_periods: int = 252     # 至少1年样本才出分
+    zscore_clip: float = 3.0          # 截断极端值，防单点主导
+    # 分位数类信号的滚动窗口
+    pctile_window: int = 756          # ~3年
+    # 合成分平滑（降低日频换手噪音）
+    score_smooth_days: int = 5
+
+    # ---- 维度权重方案 ----
+    # 'equal'       等权。最稳健的基线，也是学术上最难被打败的基准。
+    # 'inverse_vol' 逆波动加权（风险平价思路）：让每个维度对最终分差的**风险贡献**
+    #               大致相等，而不是让名义权重相等。解决"某个维度天生波动大、
+    #               实际上主导了整个信号"的问题。
+    # 'ic_weighted' 滚动IC加权：按各维度近期预测力分配权重。
+    #               业界做法（见 FactSet: A Practical Approach to Weighting Signals），
+    #               但极易过拟合，因此本实现强制两道保险：
+    #                 (a) IC 只用**已完全实现**的前瞻收益估计，严格样本外；
+    #                 (b) 向等权收缩 shrinkage，默认只走一半。
+    weight_scheme: str = "equal"
+    dimension_weights: dict[str, float] = field(
+        default_factory=lambda: {d: 1.0 / len(DIMENSIONS) for d in DIMENSIONS}
+    )
+    # 逆波动加权的滚动窗口
+    vol_weight_window: int = 252
+    # IC 加权参数
+    ic_weight_window: int = 756       # 估计IC的滚动窗口（~3年）
+    ic_weight_horizon: int = 20       # 用20日前瞻收益算IC
+    ic_weight_shrinkage: float = 0.5  # 0=纯等权, 1=纯IC加权。默认各一半。
+    ic_weight_floor: float = 0.05     # 每个维度的权重下限，防止某维度被完全清零
+
+
+@dataclass
+class BacktestConfig:
+    # 执行滞后（交易日）：
+    #   信号用 t 日收盘价算出 → t+1 收盘执行 → 从 t+2 开始赚取收益。
+    #   对应 position.shift(2)。设为1即为“收盘价当天成交”的乐观假设。
+    execution_lag: int = 2
+    # IC 的前瞻窗口
+    ic_horizons: tuple[int, ...] = (5, 20)
+    # 仓位映射：分差经 tanh 映射到 [-1, 1] 的多空仓位
+    position_scale: float = 1.0
+    # 迟滞带(hysteresis)：分差绝对值低于该阈值时维持原仓位，抑制换手
+    hysteresis_band: float = 0.15
+    # 调仓频率: None/'D' 日频, 'W' 周频, 'M' 月频。
+    # 定为月频的依据：宏观维度 IC 随期限单调上升（5日 0.085 → 20日 0.187 → 60日 0.209），
+    # 且信号自相关半衰期约 10 个月。这是慢信号，日频调仓只会把价值烧在换手上。
+    rebalance_freq: str | None = "M"
+    # 单边交易成本（bps of turnover）
+    cost_bps: float = 5.0
+    # 权重敏感性分析抽样次数
+    n_weight_draws: int = 300
+    random_seed: int = 42
+
+
+SCORING = ScoringConfig()
+BACKTEST = BacktestConfig()
+
+# --------------------------------------------------------------------------
+# 五、路径
+# --------------------------------------------------------------------------
+
+DATA_DIR = "data"
+CACHE_PRICES = f"{DATA_DIR}/prices.csv"
+CACHE_MACRO = f"{DATA_DIR}/macro.csv"
+CACHE_META = f"{DATA_DIR}/source_meta.json"
+OPTIONAL_PE_CSV = f"{DATA_DIR}/pe_history.csv"
+OUTPUT_DIR = "output"
+
+# --------------------------------------------------------------------------
+# 六、数据源优先级
+# --------------------------------------------------------------------------
+# 2026年现状：Yahoo 对未认证请求限流极凶，yfinance 已不适合当主力数据源。
+# 优先级理由：
+#   1. Tiingo   —— 免费档 500 req/小时，**已做拆股与分红复权**，数据质量高。需免费key。
+#   2. Stooq    —— 无需key、不限流，但**只有不复权收盘价**（无分红调整）。
+#   3. yfinance —— 复权正确但限流严重且接口经常变，降为最后手段。
+#
+# 分红偏差的严重性（用 Stooq 时必须知道）：
+#   QQQ 股息率约0.5%，XLY约1.2%，SPY约1.2%。做 TECH-CONSUMER 相对收益时，
+#   不复权会让科技腿每年被系统性高估约 0.7个百分点。对一个年化波动仅约6%的
+#   相对策略来说，这个偏差不可忽略——所以强烈建议配一个免费 Tiingo key。
+
+PRICE_SOURCE_PRIORITY = ["tiingo", "stooq", "yfinance"]
+
+STOOQ_CSV = "https://stooq.com/q/d/l/?s={symbol}&i=d"
+TIINGO_URL = "https://api.tiingo.com/tiingo/daily/{ticker}/prices"
+
+# 各源的股息复权情况，用于在报告与仪表盘上如实标注
+SOURCE_IS_ADJUSTED = {"tiingo": True, "stooq": False, "yfinance": True, "synthetic": True}
