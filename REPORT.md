@@ -2,7 +2,7 @@
 
 ### Macro liquidity and the Tech-vs-Consumer relative trade, 2008–2026
 
-**Tim Wang** · timothy19won@gmail.com · [github.com/Timothy-yqw19/qdii-sector-rotation](https://github.com/Timothy-yqw19/qdii-sector-rotation)
+**Yuqin (Timothy) Wang** · timothy19won@gmail.com · [github.com/Timothy-yqw19/qdii-sector-rotation](https://github.com/Timothy-yqw19/qdii-sector-rotation)
 
 ---
 
