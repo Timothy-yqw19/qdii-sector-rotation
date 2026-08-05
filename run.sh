@@ -44,6 +44,8 @@ usage() {
 
 开发与验证
   ./run.sh netcheck   逐主机连通性诊断（抓数失败时先跑这个）
+  ./run.sh charts     重新生成 charts/*.png
+  ./run.sh pdf        重生成图表并把 REPORT.md 导出为 PDF（需 pandoc + xelatex）
   ./run.sh test       跑11项防前视自查
   ./run.sh offline    用合成数据跑通全流程（无网络时验证代码）
   ./run.sh quick      跑回测但跳过权重敏感性（最快）
@@ -74,6 +76,12 @@ case "${1:-}" in
   app)     $PY -m streamlit run app.py ;;
   test)    $PY tests/test_no_lookahead.py ;;
   netcheck) $PY src/data_fetcher.py --netcheck ;;
+  charts)  $PY make_charts.py ;;
+  pdf)     $PY make_charts.py && pandoc REPORT.md -o REPORT.pdf --pdf-engine=xelatex \
+             -V geometry:margin=2.2cm -V fontsize=10.5pt \
+             -V linkcolor=blue -V urlcolor=blue \
+             -V mainfont="DejaVu Sans" -V monofont="DejaVu Sans Mono" \
+             --toc --toc-depth=2 && echo "→ REPORT.pdf" ;;
   offline) $PY run_pipeline.py --offline ;;
   clean)   rm -f data/*.csv output/*.csv && echo "已清空 data/ 与 output/" ;;
   *)       usage ;;

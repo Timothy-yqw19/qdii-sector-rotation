@@ -173,24 +173,36 @@ def build_signal_panel(
     prices: pd.DataFrame,
     macro_raw: pd.DataFrame,
     pe_df: pd.DataFrame | None = None,
+    regime: pd.Series | None = None,
 ) -> dict[str, pd.DataFrame]:
     """
     产出 {sector: DataFrame(index=date, columns=signal_key)}，
     值为 **已标准化、已按方向对齐** 的信号（越高越利好该板块）。
+
+    regime 不为 None 时，方向先验会按当日风险状态乘上 config.REGIME_MULTIPLIERS。
+    regime 序列本身由已滞后的宏观数据构造（见 regime.py），不引入前视。
     """
     trading_index = _wide(prices, "close").index
     px_sig = apply_real_pe(build_price_signals(prices), pe_df)
     mac_sig = build_macro_signals(macro_raw, trading_index)
 
+    if regime is not None:
+        regime = regime.reindex(trading_index).ffill().fillna("risk_on")
+
     panel: dict[str, pd.DataFrame] = {}
     for sector in C.SECTORS:
         raw = pd.concat([px_sig[sector], mac_sig], axis=1)
         aligned = pd.DataFrame(index=trading_index)
-        for sig in C.SIGNALS:
-            if sig.key not in raw.columns:
+        for sg in C.SIGNALS:
+            if sg.key not in raw.columns:
                 continue
-            z = rolling_zscore(raw[sig.key])
-            aligned[sig.key] = z * sig.directions.get(sector, 0.0)
+            z = rolling_zscore(raw[sg.key])
+            base = sg.directions.get(sector, 0.0)
+            if regime is None:
+                aligned[sg.key] = z * base
+            else:
+                mult = regime.map(lambda r, k=sg.key: C.regime_multiplier(k, r))
+                aligned[sg.key] = z * base * mult
         panel[sector] = aligned
     return panel
 

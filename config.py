@@ -294,6 +294,66 @@ class BacktestConfig:
     random_seed: int = 42
 
 
+# --------------------------------------------------------------------------
+# 四点五、Regime（风险状态）切换
+# --------------------------------------------------------------------------
+# 【要解决的方法论缺口】
+# 基线模型的方向先验是固定的，隐含假设"宏观变量→板块"的传导在任何环境下都一样。
+# 这个假设明显可疑：正常时期降息利好长久期成长股，但衰退期的降息是**对危机的反应**，
+# 此时"实际利率下行"往往伴随风险资产下跌，传导方向被打断甚至反转。
+#
+# 【为什么不用数据去拟合 regime 参数】
+# 全样本只有约 86 次信号方向切换（每年 4.7 次）。
+# 若再按 regime 二分、每个信号各估一套系数，等于用几十个观测去估十几个参数，
+# 几乎必然过拟合。所以本项目的做法是：
+#   1. 用经济学理由**事先声明**一套乘数（下方 REGIME_MULTIPLIERS）；
+#   2. 然后严格检验它相对固定先验是否真的改善；
+#   3. 若改善不明显，就如实报告并**保持基线模型不变**。
+# 这与前面否决动量/估值两个维度是同一套纪律。
+
+
+@dataclass
+class RegimeConfig:
+    # 用哪些序列度量市场压力（取水平值的滚动分位数后平均）
+    stress_series: tuple[str, ...] = ("BAA10Y", "VIXCLS")
+    pctile_window: int = 756          # ~3年滚动分位
+    # 迟滞阈值：压力分位数上穿 enter 进入 risk-off，下穿 exit 才回到 risk-on。
+    # 两个阈值不同是为了避免在边界反复横跳（与仓位迟滞带同样的道理）。
+    enter_risk_off: float = 0.70
+    exit_risk_off: float = 0.50
+    # 是否启用。默认 False —— 先当作待检验的假设，而不是既定设计。
+    enabled: bool = False
+    # risk-off 时整体降低敞口的比例（1.0 = 不降）。作为独立变体单独检验。
+    risk_off_gross_scale: float = 1.0
+
+
+REGIME = RegimeConfig()
+
+REGIME_LABELS = {"risk_on": "风险偏好(risk-on)", "risk_off": "风险规避(risk-off)"}
+
+# 各信号在 risk-off 状态下的方向乘数（risk-on 恒为 1.0 作为基准）。
+# 全部来自经济学推理，不是拟合出来的：
+REGIME_MULTIPLIERS: dict[str, float] = {
+    # 利率类：压力期传导被打断。降息是对危机的反应而非宽松红利，
+    # 此时"实际利率下行→利好成长"的逻辑失效，故大幅衰减而非简单沿用。
+    "DFII10_diff_60d": 0.3,
+    # 央行扩表：压力期的扩表同样是被动救火，信号含义被污染，衰减一半。
+    "WALCL_pct_chg_60d": 0.5,
+    # 风险类：压力期反而更灵敏——利差走阔、VIX跳升对高贝塔的杀伤被放大。
+    "BAA10Y_diff_20d": 1.5,
+    "VIXCLS_diff_20d": 1.5,
+    # 美元：压力期的美元走强是避险资金回流的症状，对海外收入占比高的科技冲击更大。
+    "DTWEXBGS_pct_chg_60d": 1.3,
+}
+
+
+def regime_multiplier(signal_key: str, regime: str) -> float:
+    """risk-on 恒为 1.0；risk-off 查表，未列出的信号默认不变。"""
+    if regime != "risk_off":
+        return 1.0
+    return REGIME_MULTIPLIERS.get(signal_key, 1.0)
+
+
 SCORING = ScoringConfig()
 BACKTEST = BacktestConfig()
 

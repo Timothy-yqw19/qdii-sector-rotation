@@ -539,6 +539,101 @@ def weight_sensitivity(
     return pd.DataFrame(rows)
 
 
+def regime_conditional_ic(
+    panel: dict[str, pd.DataFrame],
+    regime: pd.Series,
+    prices: pd.DataFrame,
+    horizon: int = 20,
+) -> pd.DataFrame:
+    """
+    【检验固定方向先验的假设是否成立】
+
+    对每个信号，分别在 risk-on / risk-off 下算 IC。
+    - 若两态 IC 接近 → 固定先验没问题，regime 切换是多余的复杂度；
+    - 若某信号在两态下**符号相反或幅度悬殊** → 固定先验确实丢了信息，
+      regime 切换有依据。
+
+    注意这是**诊断**，不是拟合：看到差异不等于该按差异去调参数，
+    因为 risk-off 样本量小、容易是噪音。诊断结果只用来判断
+    事先声明的那套乘数方向对不对。
+    """
+    rel = relative_return(leg_returns(prices))
+    fwd = forward_relative_return(rel, horizon)
+    long_p, short_p = panel[C.LONG_LEG], panel[C.SHORT_LEG]
+    reg = regime.reindex(long_p.index).ffill()
+
+    rows = []
+    for s in C.SIGNALS:
+        if s.key not in long_p.columns:
+            continue
+        spread = (long_p[s.key] - short_p[s.key])
+        row = {"信号": s.name, "维度": C.DIMENSION_LABELS.get(s.dimension, s.dimension)}
+        for state in ("risk_on", "risk_off"):
+            m = reg == state
+            df = pd.concat([spread[m].rename("s"), fwd.rename("f")], axis=1).dropna()
+            row[f"IC_{state}"] = spearman(df["s"], df["f"]) if len(df) >= 100 else np.nan
+            row[f"n_{state}"] = len(df)
+        row["预设risk_off乘数"] = C.REGIME_MULTIPLIERS.get(s.key, 1.0)
+        rows.append(row)
+    return pd.DataFrame(rows).set_index("信号")
+
+
+def compare_regime_variants(
+    prices: pd.DataFrame,
+    macro_raw: pd.DataFrame,
+    regime: pd.Series,
+    pe_df: pd.DataFrame | None = None,
+    horizon: int = 20,
+) -> pd.DataFrame:
+    """
+    三个变体同口径对比，决定 regime 切换该不该进最终模型：
+      baseline       固定方向先验（当前模型）
+      regime_priors  方向先验按 risk-on/off 切换
+      regime_scaled  方向先验不变，但 risk-off 时整体降敞口
+
+    判定标准要事先说清楚：改善必须**同时**体现在 IC 与扣成本夏普上，
+    且幅度要明显超过噪音水平，否则按奥卡姆剃刀保留基线。
+    """
+    import src.regime as rg  # noqa: PLC0415
+    import src.signals as sg  # noqa: PLC0415
+
+    legs = leg_returns(prices)
+    rel = relative_return(legs)
+    fwd = forward_relative_return(rel, horizon)
+    reg = regime.reindex(prices["date"].unique()).ffill()
+
+    def _row(name: str, scores: dict, pos: pd.Series) -> dict:
+        res = run_strategy(pos, legs)
+        df = pd.concat([scores["spread"].rename("s"), fwd.rename("f")],
+                       axis=1).dropna()
+        return {
+            "variant": name,
+            f"IC_{horizon}d": spearman(df["s"], df["f"]),
+            "hit_rate": float((np.sign(df["s"]) == np.sign(df["f"])).mean()),
+            "sharpe_net": res["stats"]["long_short_net"].get("sharpe", np.nan),
+            "IR_vs_bench": res["stats"]["excess_vs_bench"].get("sharpe", np.nan),
+            "maxdd": res["stats"]["long_short_net"].get("max_drawdown", np.nan),
+            "turnover": res["stats"]["long_short_net"].get("ann_turnover", np.nan),
+        }
+
+    rows = []
+    base_panel = sg.build_signal_panel(prices, macro_raw, pe_df)
+    base = scoring.run_scoring(base_panel, rel_ret=rel)
+    rows.append(_row("baseline", base, base["positions"]))
+
+    reg_panel = sg.build_signal_panel(prices, macro_raw, pe_df, regime=regime)
+    reg_scores = scoring.run_scoring(reg_panel, rel_ret=rel)
+    rows.append(_row("regime_priors", reg_scores, reg_scores["positions"]))
+
+    # 降敞口变体：信号不变，只在 risk-off 时把仓位按比例缩小
+    scale = pd.Series(1.0, index=base["positions"].index)
+    r = regime.reindex(scale.index).ffill().fillna("risk_on")
+    scale[r == "risk_off"] = 0.5
+    rows.append(_row("regime_scaled(0.5x)", base, base["positions"] * scale))
+
+    return pd.DataFrame(rows).set_index("variant")
+
+
 def compare_weight_schemes(
     panel: dict[str, pd.DataFrame],
     prices: pd.DataFrame,

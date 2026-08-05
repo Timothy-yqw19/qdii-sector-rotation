@@ -28,6 +28,7 @@ sys.path.insert(0, ROOT)
 import config as C  # noqa: E402
 from src import backtest as bt  # noqa: E402
 from src import data_fetcher as dfetch  # noqa: E402
+from src import regime as rg  # noqa: E402
 from src import scoring  # noqa: E402
 from src import signals as sig  # noqa: E402
 
@@ -92,7 +93,12 @@ def main() -> None:
     active_dims = [d.strip() for d in dims_arg.split(",")] if dims_arg else None
 
     print("\n[信号] 构建信号面板（滚动z-score + 发布滞后对齐）...")
-    panel = sig.build_signal_panel(prices, macro, pe)
+    trading_index = prices.pivot(index="date", columns="ticker",
+                                 values="close").sort_index().index
+    regime_series = rg.build_regime(macro, trading_index)
+    use_regime = "--regime" in argv or C.REGIME.enabled
+    panel = sig.build_signal_panel(prices, macro, pe,
+                                   regime=regime_series if use_regime else None)
 
     print(f"[打分] 维度分 → 合成分 → 轮动分差（权重方案: "
           f"{scheme or C.SCORING.weight_scheme}）...")
@@ -187,6 +193,24 @@ def main() -> None:
     print("解读：全样本IC为正但只有某一段极强 → 那是单一regime的单边押注，不是择时能力。"
           "各段符号一致才算稳健。rel_drift_ann 是该段两板块的真实相对漂移，"
           "用来判断信号是不是只在顺风段有效。")
+
+    if "--no-regime-test" not in argv:
+        print(f"\n--- 1.7 Regime 切换检验【最后一个方法论缺口】---")
+        print(rg.summarize(regime_series).to_string())
+        print("\n各信号在两种风险状态下的 IC(20d)：")
+        print(bt.regime_conditional_ic(panel, regime_series, prices)
+              .round(4).to_string())
+        print("\n三个变体同口径对比：")
+        cmpv = bt.compare_regime_variants(prices, macro, regime_series, pe)
+        print(cmpv.round(4).to_string())
+        base, rp = cmpv.loc["baseline"], cmpv.loc["regime_priors"]
+        d_ic = rp["IC_20d"] - base["IC_20d"]
+        d_sh = rp["sharpe_net"] - base["sharpe_net"]
+        verdict = ("采纳" if (d_ic > 0.01 and d_sh > 0.05) else "不采纳")
+        print(f"\n判定：ΔIC={d_ic:+.4f}, Δ净夏普={d_sh:+.3f} → **{verdict}**")
+        print("判定标准事先声明：IC 与扣成本夏普必须**同时**改善且超过噪音水平，"
+              "否则按奥卡姆剃刀保留基线。样本里每年仅约4.7次独立押注，"
+              "regime二分会进一步切薄样本，宁可保守。")
 
     print(f"\n--- 2. 分层测试 (horizon=20d) ---")
     print(results["buckets"][20].round(4).to_string())

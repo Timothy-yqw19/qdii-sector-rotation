@@ -259,6 +259,62 @@ def test_inverse_vol_equalizes_risk():
 
 
 # ==========================================================================
+def test_regime_classification_is_causal():
+    """
+    Regime 判定必须只用截止当日的信息。
+    做法：截断数据重跑，截断前的状态序列必须逐点相同。
+    另外验证迟滞确实生效——状态段不应碎成一堆一两天的片段。
+    """
+    from src import regime as rg
+
+    cut = pd.Timestamp("2021-06-30")
+    idx_full = PRICES.pivot(index="date", columns="ticker", values="close").index
+    full = rg.build_regime(MACRO, idx_full)
+
+    p_cut = PRICES[PRICES["date"] <= cut]
+    idx_cut = p_cut.pivot(index="date", columns="ticker", values="close").index
+    trunc = rg.build_regime(MACRO[MACRO.index <= cut], idx_cut)
+
+    common = full.index.intersection(trunc.index)
+    common = common[common <= cut]
+    assert len(common) > 500, "共同区间太短，测试无意义"
+    mismatch = (full.loc[common] != trunc.loc[common]).sum()
+    assert mismatch == 0, f"截断前有 {mismatch} 天的 regime 判定不同 → 存在前视"
+
+    # 迟滞有效性：平均持续时间不应短到只有几天
+    summ = rg.summarize(full)
+    avg = summ["平均持续(交易日)"].min()
+    assert avg >= 10, f"状态段平均仅 {avg} 天，迟滞未生效，会制造无意义换手"
+    print(f"✓ Regime 判定严格因果，最短平均持续 {avg} 交易日（迟滞有效）")
+
+
+def test_regime_panel_truncation_invariance():
+    """开启 regime 的信号面板同样要通过截断不变性。"""
+    from src import regime as rg
+
+    cut = pd.Timestamp("2021-06-30")
+    idx_full = PRICES.pivot(index="date", columns="ticker", values="close").index
+    reg_full = rg.build_regime(MACRO, idx_full)
+    full = sig.build_signal_panel(PRICES, MACRO, regime=reg_full)
+
+    p_cut = PRICES[PRICES["date"] <= cut]
+    m_cut = MACRO[MACRO.index <= cut]
+    idx_cut = p_cut.pivot(index="date", columns="ticker", values="close").index
+    reg_cut = rg.build_regime(m_cut, idx_cut)
+    trunc = sig.build_signal_panel(p_cut, m_cut, regime=reg_cut)
+
+    for sector in C.SECTORS:
+        a, b = full[sector].loc[:cut], trunc[sector].loc[:cut]
+        common = a.index.intersection(b.index)
+        for col in a.columns:
+            x, y = a.loc[common, col], b.loc[common, col]
+            both = x.notna() & y.notna()
+            assert np.allclose(x[both], y[both], atol=1e-10), \
+                f"regime模式下 {sector}/{col} 截断前后不一致 → 前视"
+    print("✓ regime 模式下的信号面板通过截断不变性")
+
+
+# ==========================================================================
 def test_hysteresis_reduces_turnover():
     panel = sig.build_signal_panel(PRICES, MACRO)
     scores = scoring.run_scoring(panel)
