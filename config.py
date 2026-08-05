@@ -354,6 +354,132 @@ def regime_multiplier(signal_key: str, regime: str) -> float:
     return REGIME_MULTIPLIERS.get(signal_key, 1.0)
 
 
+# --------------------------------------------------------------------------
+# 四点六、多板块对扩展：把方向先验从"手写"改成"由板块属性推导"
+# --------------------------------------------------------------------------
+# 【为什么需要】
+# 单对(科技vs消费)只有 23 个第5档独立事件，样本量撑不起任何二次切分
+# （见 find_patterns.py：六条假设全部因样本不足或不显著而无法采纳）。
+# 扩到多对可以把事件数提升一个数量级，并且顺带回答一个更硬的问题：
+# 这个宏观信号是**只在科技vs消费上成立**，还是有跨板块的普遍性？
+#
+# 【为什么不能手写方向先验】
+# "科技久期长、海外收入占比高"这套推理没法直接套到金融vs公用事业上。
+# 手写 N 对就要写 N 套先验，既不可审也容易前后矛盾。
+# 改成：每个板块打三个属性分，信号方向由属性自动推导。
+# 加一个新板块只需填三个数，逻辑保持一致。
+
+# 属性取值参考现实特征，量纲统一到 0~1.3：
+#   duration : 现金流久期。成长股高、公用事业因高分红久期看似低但对利率极敏感
+#              （债券替代属性），故给中高值；必需消费与金融偏低。
+#   foreign  : 海外收入占比。半导体/科技最高，公用事业几乎为0。
+#   beta     : 相对大盘的波动/周期敏感度。
+SECTOR_ATTRS: dict[str, dict[str, float]] = {
+    "TECH":        {"duration": 1.00, "foreign": 1.00, "beta": 1.00},
+    "SEMIS":       {"duration": 1.00, "foreign": 1.30, "beta": 1.30},
+    "CONS_DISC":   {"duration": 0.50, "foreign": 0.30, "beta": 0.90},
+    "STAPLES":     {"duration": 0.25, "foreign": 0.40, "beta": 0.40},
+    "UTILITIES":   {"duration": 0.80, "foreign": 0.05, "beta": 0.45},
+    "FINANCIALS":  {"duration": 0.25, "foreign": 0.25, "beta": 1.05},
+    "HEALTHCARE":  {"duration": 0.60, "foreign": 0.45, "beta": 0.65},
+    "INDUSTRIALS": {"duration": 0.40, "foreign": 0.50, "beta": 1.00},
+}
+
+SECTOR_TICKERS: dict[str, dict] = {
+    "TECH":        {"primary": "XLK", "proxies": ["QQQ"], "label": "科技"},
+    "SEMIS":       {"primary": "SMH", "proxies": [],      "label": "半导体"},
+    "CONS_DISC":   {"primary": "XLY", "proxies": ["XRT"], "label": "可选消费"},
+    "STAPLES":     {"primary": "XLP", "proxies": [],      "label": "必需消费"},
+    "UTILITIES":   {"primary": "XLU", "proxies": [],      "label": "公用事业"},
+    "FINANCIALS":  {"primary": "XLF", "proxies": [],      "label": "金融"},
+    "HEALTHCARE":  {"primary": "XLV", "proxies": [],      "label": "医疗"},
+    "INDUSTRIALS": {"primary": "XLI", "proxies": [],      "label": "工业"},
+}
+
+# 每个宏观信号由哪个属性驱动、符号如何。
+# 这是全部的方向逻辑，加板块不需要再碰这里。
+SIGNAL_ATTR_MAP: dict[str, tuple[str, float]] = {
+    "DFII10_diff_60d":      ("duration", -1.0),  # 实际利率上行压制长久期
+    "DTWEXBGS_pct_chg_60d": ("foreign",  -1.0),  # 强美元压制海外收入
+    "BAA10Y_diff_20d":      ("beta",     -1.0),  # 利差走阔打击高贝塔
+    "VIXCLS_diff_20d":      ("beta",     -1.0),  # 波动上行同理
+    "WALCL_pct_chg_60d":    ("duration", +1.0),  # 扩表利好长久期
+}
+
+# 待检验的板块对。选择标准：两侧在某个属性上有明显差异，
+# 否则该信号在分差里会被抵消掉（见 README 第一节关于"相对"的说明）。
+SECTOR_PAIRS: list[tuple[str, str]] = [
+    ("TECH", "CONS_DISC"),      # 原始对：久期差 + 海外收入差
+    ("TECH", "STAPLES"),        # 成长 vs 防御，久期差最大
+    ("SEMIS", "STAPLES"),       # 同上但更极端
+    ("TECH", "UTILITIES"),      # 两者久期都高，主要差在贝塔与海外收入
+    ("CONS_DISC", "STAPLES"),   # 经典风险偏好对，久期差小、贝塔差大
+    ("FINANCIALS", "UTILITIES"),  # 久期方向相反的一对
+    ("INDUSTRIALS", "STAPLES"),   # 周期 vs 防御
+    ("TECH", "HEALTHCARE"),     # 成长内部分化
+]
+
+MULTIPAIR_TICKERS = sorted(
+    {BENCHMARK}
+    | {SECTOR_TICKERS[s]["primary"] for s in SECTOR_TICKERS}
+    | {p for s in SECTOR_TICKERS.values() for p in s["proxies"]}
+)
+
+
+# --------------------------------------------------------------------------
+# 四点七、样本外检验用的长历史配置（2000–2007 是完全未被使用过的样本）
+# --------------------------------------------------------------------------
+# 【为什么需要另一套序列】
+# 主模型的 5 个宏观信号里有 3 个在 2007 年前不存在：
+#   DFII10   10年期TIPS实际利率 —— 2003年起
+#   DTWEXBGS 广义美元指数       —— 2006年起
+#   WALCL    美联储总资产       —— 2002年起
+# 直接把主模型往前跑，前期会有一半信号是空的，结果没有解释力。
+#
+# 【替代原则：同一个经济含义，换一个有长历史的度量】
+#   实际利率 → DGS10 名义10年美债（1962年起）。名义与实际在60日变化尺度上高度同向。
+#   广义美元 → DTWEXM 主要货币美元指数（1973–2020）。同为贸易加权，覆盖更早。
+#   联储扩表 → **直接丢弃**。M2 是月频且含义不同，强行替代不如不用。
+#
+# 【关键设计：新旧两段跑的是同一个 4 信号简化模型】
+# 否则"样本外表现较差"会分不清是模型失效还是信号变少了。
+# DTWEXM 于 2020 年停更，所以对照段取 2008–2019。
+
+OOS_SERIES: list["MacroSeries"] = []   # 在 MacroSeries 定义之后填充（见文件末尾）
+
+OOS_SIGNAL_ATTR_MAP: dict[str, tuple[str, float]] = {
+    "DGS10_diff_60d":      ("duration", -1.0),
+    "DTWEXM_pct_chg_60d":  ("foreign",  -1.0),
+    "BAA10Y_diff_20d":     ("beta",     -1.0),
+    "VIXCLS_diff_20d":     ("beta",     -1.0),
+}
+
+# 板块 ETF 的实际成立日：SPDR 系列 1998-12-22，QQQ 1999-03，SMH/XRT 更晚。
+OOS_PRICE_START = "1998-12-22"
+OOS_PERIODS = {
+    "样本外 2000-2007": ("2000-01-01", "2007-12-31"),
+    "对照   2008-2019": ("2008-01-01", "2019-12-31"),
+}
+
+
+def derive_directions_oos(sector: str) -> dict[str, float]:
+    attrs = SECTOR_ATTRS[sector]
+    return {k: sign * attrs[attr] for k, (attr, sign) in OOS_SIGNAL_ATTR_MAP.items()}
+
+
+def derive_directions(sector: str) -> dict[str, float]:
+    """由板块属性推导该板块在各宏观信号上的方向先验。"""
+    attrs = SECTOR_ATTRS[sector]
+    return {key: sign * attrs[attr] for key, (attr, sign) in SIGNAL_ATTR_MAP.items()}
+
+
+OOS_SERIES = [
+    MacroSeries("DGS10", "10年期美债名义收益率", 1, "diff_60d"),
+    MacroSeries("DTWEXM", "美元指数(主要货币,长历史)", 4, "pct_chg_60d"),
+    MacroSeries("BAA10Y", "穆迪Baa-10年美债信用利差", 1, "diff_20d"),
+    MacroSeries("VIXCLS", "VIX波动率指数", 1, "diff_20d"),
+]
+
 SCORING = ScoringConfig()
 BACKTEST = BacktestConfig()
 

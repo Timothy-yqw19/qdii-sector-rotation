@@ -44,9 +44,15 @@ usage() {
 
 开发与验证
   ./run.sh netcheck   逐主机连通性诊断（抓数失败时先跑这个）
+  ./run.sh history    历史读数复盘 + 第5档/第1档独立事件表
+  ./run.sh patterns   在事件上检验事先声明的假设（含阴性对照与置换检验）
+  ./run.sh pairs      多板块对交叉检验（首次需 ./run.sh pairs-fetch 补数据）
+  ./run.sh pairs-fetch 补抓多板块对所需标的后再跑
+  ./run.sh oos-fetch  拉取1998年起的长历史数据(样本外检验用)
+  ./run.sh oos        样本外检验:2000-2007 vs 2008-2019
   ./run.sh charts     重新生成 charts/*.png
   ./run.sh pdf        重生成图表并把 REPORT.md 导出为 PDF（需 pandoc + xelatex）
-  ./run.sh test       跑11项防前视自查
+  ./run.sh test       跑13项防前视自查
   ./run.sh offline    用合成数据跑通全流程（无网络时验证代码）
   ./run.sh quick      跑回测但跳过权重敏感性（最快）
   ./run.sh clean      清掉缓存与回测输出
@@ -76,6 +82,12 @@ case "${1:-}" in
   app)     $PY -m streamlit run app.py ;;
   test)    $PY tests/test_no_lookahead.py ;;
   netcheck) $PY src/data_fetcher.py --netcheck ;;
+  history)     $PY explain_history.py --months=24 ;;
+  patterns)    $PY find_patterns.py ;;
+  pairs)       $PY multipair.py ;;
+  pairs-fetch) $PY multipair.py --fetch ;;
+  oos)         $PY oos_test.py ;;
+  oos-fetch)   $PY oos_test.py --fetch ;;
   charts)  $PY make_charts.py ;;
   pdf)     $PY make_charts.py && pandoc REPORT.md -o REPORT.pdf --pdf-engine=xelatex \
              -V geometry:margin=2.2cm -V fontsize=10.5pt \

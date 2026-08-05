@@ -174,6 +174,7 @@ def build_signal_panel(
     macro_raw: pd.DataFrame,
     pe_df: pd.DataFrame | None = None,
     regime: pd.Series | None = None,
+    macro_series: list[C.MacroSeries] | None = None,
 ) -> dict[str, pd.DataFrame]:
     """
     产出 {sector: DataFrame(index=date, columns=signal_key)}，
@@ -181,10 +182,12 @@ def build_signal_panel(
 
     regime 不为 None 时，方向先验会按当日风险状态乘上 config.REGIME_MULTIPLIERS。
     regime 序列本身由已滞后的宏观数据构造（见 regime.py），不引入前视。
+
+    macro_series 可指定另一套宏观序列（样本外检验用长历史替代序列，见 oos_test.py）。
     """
     trading_index = _wide(prices, "close").index
     px_sig = apply_real_pe(build_price_signals(prices), pe_df)
-    mac_sig = build_macro_signals(macro_raw, trading_index)
+    mac_sig = build_macro_signals(macro_raw, trading_index, series=macro_series)
 
     if regime is not None:
         regime = regime.reindex(trading_index).ffill().fillna("risk_on")

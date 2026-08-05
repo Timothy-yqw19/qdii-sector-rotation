@@ -168,7 +168,116 @@ def main() -> None:
                  fontsize=11.5, x=0.09, ha="left", y=1.02)
     _save(fig, "05_dimension_screening.png")
 
-    print(f"\n{5} charts → charts/")
+    make_oos_charts()
+    print("\ncharts → charts/")
+
+
+# ==========================================================================
+# 样本外检验图（需先跑 oos_test.py --fetch 生成 data/macro_long.csv）
+# ==========================================================================
+
+def make_oos_charts() -> None:
+    import config as Cfg
+    macro_path = os.path.join(ROOT, "data", "macro_long.csv")
+    if not os.path.exists(macro_path):
+        print("  [skip] 缺 data/macro_long.csv，跳过样本外图（先跑 ./run.sh oos-fetch）")
+        return
+
+    import oos_test as oos
+    macro_long = pd.read_csv(macro_path, index_col=0, parse_dates=True)
+    prices, _ = dfetch.load_cache(ROOT)
+    if prices["date"].min() > pd.Timestamp("2000-06-01"):
+        print("  [skip] 价格未回溯到1999年，跳过样本外图")
+        return
+
+    # ---------- 06 分段 IC 断点 ----------
+    with oos.oos_pair_context("TECH", "STAPLES"):
+        sub = prices[prices["ticker"].isin({"XLK", "XLP", "SPY"})]
+        panel = sig.build_signal_panel(sub, macro_long, macro_series=Cfg.OOS_SERIES)
+        legs = bt.leg_returns(sub)
+        rel = bt.relative_return(legs)
+        sc = scoring.run_scoring(panel, rel_ret=rel, active_dims=["macro_liquidity"])
+    spread = sc["spread"].dropna()
+    fwd = bt.forward_relative_return(rel, 20)
+
+    segs = [("2000-01", "2003-12"), ("2004-01", "2007-12"),
+            ("2008-01", "2013-12"), ("2014-01", "2019-12")]
+    ics = []
+    for lo, hi in segs:
+        m = (spread.index >= lo) & (spread.index <= hi)
+        df = pd.concat([spread[m].rename("s"), fwd.rename("f")], axis=1).dropna()
+        ics.append(bt.spearman(df["s"], df["f"]) if len(df) > 200 else np.nan)
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    cols = [GREY, GREY, NAVY, NAVY]
+    ax.bar(range(4), ics, color=cols, width=0.55)
+    ax.axvline(1.5, color=RED, ls="--", lw=1.4)
+    # 图内一律用英文：容器里没有中文字体，混中文会渲染成方框
+    ax.text(1.55, max(ics) * 0.92, "  2008: QE era begins", fontsize=9.5, color=RED)
+    ax.set_xticks(range(4))
+    ax.set_xticklabels([f"{a}\n~{b}" for a, b in segs], fontsize=8.5)
+    ax.set_ylabel("Spearman IC (20d)")
+    ax.axhline(0, color="black", lw=0.8)
+    ax.set_title("A clean structural break at 2008\n"
+                 "The same 4-signal model is 3–5× stronger after QE begins",
+                 fontsize=11, loc="left")
+    _save(fig, "06_regime_break.png")
+
+    # ---------- 07 样本外 vs 对照段逐对 ----------
+    path = os.path.join(ROOT, C.OUTPUT_DIR, "oos_results.csv")
+    if os.path.exists(path):
+        r = pd.read_csv(path)
+        piv = r.pivot(index="板块对", columns="时段", values="sharpe_net")
+        oos_col = [c for c in piv.columns if "样本外" in c][0]
+        ins_col = [c for c in piv.columns if "对照" in c][0]
+        piv = piv.sort_values(ins_col)
+        names_en = {"半导体 vs 必需消费": "Semis vs Staples",
+                    "可选消费 vs 必需消费": "Disc. vs Staples",
+                    "工业 vs 必需消费": "Indust. vs Staples",
+                    "科技 vs 公用事业": "Tech vs Utilities",
+                    "科技 vs 医疗": "Tech vs Health",
+                    "科技 vs 可选消费": "Tech vs Disc.",
+                    "科技 vs 必需消费": "Tech vs Staples",
+                    "金融 vs 公用事业": "Fin. vs Utilities"}
+        y = np.arange(len(piv))
+        fig, ax = plt.subplots(figsize=(8.5, 4.2))
+        ax.barh(y + 0.2, piv[ins_col], height=0.38, color=NAVY,
+                label="2008–2019 (in-sample era)")
+        ax.barh(y - 0.2, piv[oos_col], height=0.38, color=RED,
+                label="2000–2007 (out-of-sample)")
+        ax.axvline(0, color="black", lw=0.8)
+        ax.set_yticks(y)
+        ax.set_yticklabels([names_en.get(i, i) for i in piv.index], fontsize=8.5)
+        ax.set_xlabel("Net Sharpe")
+        ax.set_title("Out-of-sample: every single pair turns negative\n"
+                     "8/8 positive in-sample → 0/8 positive out-of-sample",
+                     fontsize=11, loc="left")
+        ax.legend(frameon=False, fontsize=9, loc="lower right")
+        _save(fig, "07_oos_by_pair.png")
+
+    # ---------- 08 科网泡沫期：模型说什么 vs 实际发生什么 ----------
+    m = (spread.index >= "2000-01-01") & (spread.index <= "2004-06-30")
+    sp, rr = spread[m], rel[(rel.index >= "2000-01-01") & (rel.index <= "2004-06-30")]
+    cum = (1 + rr.fillna(0)).cumprod()
+    fig, (a1, a2) = plt.subplots(2, 1, figsize=(9, 5.6), sharex=True,
+                                 gridspec_kw={"height_ratios": [1, 1.3]})
+    a1.fill_between(sp.index, 0, sp, where=sp > 0, color=NAVY, alpha=0.75,
+                    label="Model says: overweight tech")
+    a1.fill_between(sp.index, 0, sp, where=sp <= 0, color=GREY, alpha=0.6,
+                    label="Model says: underweight tech")
+    a1.axhline(0, color="black", lw=0.8)
+    a1.set_ylabel("Signal spread (z)")
+    a1.legend(frameon=False, fontsize=8.5, loc="upper right")
+    a1.set_title("Dot-com bust: the model was long tech through a 50% collapse",
+                 fontsize=11, loc="left")
+
+    a2.plot(cum.index, cum, color=RED, lw=1.6)
+    a2.axhline(1.0, color=GREY, lw=0.8)
+    a2.set_ylabel("Tech vs Staples (cumulative)")
+    a2.set_title("Fed cut 6.5% → 1%; the rate signal read it as a tailwind. "
+                 "It was a response to the crash.", fontsize=9.5, loc="left",
+                 color=GREY)
+    _save(fig, "08_dotcom_failure.png")
 
 
 if __name__ == "__main__":
